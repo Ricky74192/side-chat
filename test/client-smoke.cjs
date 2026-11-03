@@ -160,6 +160,7 @@ function createEnv(options) {
     fork: [],
     rename: [],
     archive: [],
+    unarchive: [],
     openTab: [],
     getCalls: []
   };
@@ -213,6 +214,13 @@ function createEnv(options) {
     retain: function (target, retainOptions) {
       const id = typeof target === 'string' ? target : target.sessionId;
       record.retain.push({ id: id, source: retainOptions && retainOptions.source });
+      const flaky = opts.flaky || {};
+      const remaining = flaky[id] || 0;
+      if (remaining > 0) {
+        // 复现实测现象：fork 刚返回时子会话还没在客户端物化，retain 抛 unknown session
+        flaky[id] = remaining - 1;
+        throw new Error('sessions.retain: unknown session ' + id);
+      }
       if (opts.unknown instanceof Set && opts.unknown.has(id)) throw new Error('unknown session ' + id);
       const binding = makeBinding(id);
       return {
@@ -232,12 +240,20 @@ function createEnv(options) {
       record.fork.push(request.sessionId);
       forkCount += 1;
       return Promise.resolve('side-' + forkCount);
+    },
+    refresh: function () {
+      record.refresh = (record.refresh || 0) + 1;
+      return Promise.resolve();
     }
   };
 
   const uiWorkspace = {
     archiveSession: function (sessionId, archiveOptions) {
       record.archive.push({ id: sessionId, options: archiveOptions });
+      return Promise.resolve();
+    },
+    unarchiveSession: function (sessionId) {
+      record.unarchive.push(sessionId);
       return Promise.resolve();
     }
   };
@@ -480,7 +496,18 @@ async function main() {
   eq('复用时零 fork', B.env.record.fork.length, 0);
   eq('复用时零改名', B.env.record.rename.length, 0);
 
-  // 4.3 记录失效（认领抛错）→ 丢掉重 fork
+  // 4.2b 回归：fork 刚返回时子会话还没物化（retain 抛 unknown session）→ 重试后接住
+  //      —— 这就是使用者「试了几次都是附着失败」的真实成因，别再退化成一次就放弃。
+  const flakyEnv = boot({ flaky: { 'side-1': 2 } });
+  const managerFlaky = flakyEnv.I.createAttachments(flakyEnv.env.ctx, flakyEnv.t);
+  const flakyEntry = await managerFlaky.ensure('p2b');
+  eq('瞬时未物化也能接住', flakyEntry.childId, 'side-1');
+  eq('只 fork 一次（不重复造会话）', flakyEnv.env.record.fork.length, 1);
+  eq('重试到第三次才成功', flakyEnv.env.record.retain.length, 3);
+  eq('认领失败不归档自己的子会话', flakyEnv.env.record.archive.length, 0);
+  eq('附着关系落到 localStorage', flakyEnv.env.readStored(PREFIX + 'p2b'), 'side-1');
+
+  // 4.3 记录失效（认领抛错）→ 丢掉重 fork（并把废会话归档，不在侧栏留垃圾）
   const staleStorage = new Map();
   staleStorage.set(PREFIX + 'p3', 'ghost');
   const C = boot({ stored: staleStorage, unknown: new Set(['ghost']) });
@@ -489,6 +516,13 @@ async function main() {
   eq('失效记录被换掉', firstC.childId, 'side-1');
   eq('失效记录触发 fork', C.env.record.fork.length, 1);
   eq('localStorage 被改写', C.env.readStored(PREFIX + 'p3'), 'side-1');
+  ok('复用记录前先取消归档', C.env.record.unarchive.indexOf('ghost') >= 0, JSON.stringify(C.env.record.unarchive));
+  ok('废会话被归档', C.env.record.archive.some(function (row) {
+    return row.id === 'ghost';
+  }), JSON.stringify(C.env.record.archive.map(function (row) {
+    return row.id;
+  })));
+  ok('认领前试过刷新列表', (C.env.record.refresh || 0) >= 1, String(C.env.record.refresh));
 
   // 4.4 记录能认领但打开态是 error → 也丢掉重 fork
   const brokenStorage = new Map();
@@ -521,22 +555,32 @@ async function main() {
   eq('结束后归档当前子会话', A.env.record.archive[1].id, 'side-2');
   eq('结束后缓存清空', managerA.peek('p1'), undefined);
 
-  // 4.8 关闭 tab 不等于结束：引用还在，缓存不丢
+  // 4.8 关闭 tab 不等于结束：缓存还在，归档要等 suspend
   const F = boot();
   const managerF = F.I.createAttachments(F.env.ctx, F.t);
   const firstF = await managerF.ensure('p6');
   ok('缓存里还留着', managerF.peek('p6') === firstF);
   eq('没有归档', F.env.record.archive.length, 0);
 
-  // 4.9 卸载释放引用
-  managerF.dispose();
-  ok('卸载释放引用', F.env.record.release.indexOf(firstF.childId) >= 0, JSON.stringify(F.env.record.release));
-  eq('卸载后缓存清空', managerF.peek('p6'), undefined);
+  // 4.8b 收起面板（suspend）→ 释放引用 + 归档，侧边栏那条随之消失
+  await managerF.suspend('p6');
+  eq('收起后缓存清空', managerF.peek('p6'), undefined);
+  ok('收起释放了引用', F.env.record.release.indexOf(firstF.childId) >= 0, JSON.stringify(F.env.record.release));
+  eq('收起归档了侧边会话', F.env.record.archive[0].id, firstF.childId);
+  eq('localStorage 里仍记着它（下次打开接着聊）', F.env.readStored(PREFIX + 'p6'), firstF.childId);
+
+  // 4.9 卸载释放引用（换一份干净的环境，免得和 suspend 的释放混在一起）
+  const G0 = boot();
+  const managerG0 = G0.I.createAttachments(G0.env.ctx, G0.t);
+  const firstG0 = await managerG0.ensure('p7');
+  managerG0.dispose();
+  ok('卸载释放引用', G0.env.record.release.indexOf(firstG0.childId) >= 0, JSON.stringify(G0.env.record.release));
+  eq('卸载后缓存清空', managerG0.peek('p7'), undefined);
 
   // 4.10 空主会话 id
   let rejected = null;
   try {
-    await managerF.ensure('');
+    await managerG0.ensure('');
   } catch (error) {
     rejected = error;
   }

@@ -50,6 +50,9 @@ window.__ModuleLoader__.load({
     const TITLE_MAX = 48;
     /** 等 `reference.ready` 的上限；超过就先把界面放出来，会话自己的 loading 态会接手。 */
     const READY_TIMEOUT_MS = 8000;
+    /** 认领的重试预算：fork 返回时对象常常还没物化（见 `claim` 的注释）。 */
+    const CLAIM_ATTEMPTS = 6;
+    const CLAIM_RETRY_MS = 250;
     /** 触发按钮在 header 工具组里的位置：排在宿主那几枚（-10 / -5 / 0）之前，最靠标题。 */
     const TRIGGER_ORDER = -20;
 
@@ -61,7 +64,7 @@ window.__ModuleLoader__.load({
         'guide.title': '侧边对话',
         'guide.description': '附着在主对话上，另开一个问题不打断它',
         'childTitle.prefix': '侧边对话',
-        'note.shared': '附着主对话 · 双向独立',
+        'note.shared': '附着主对话 · 双向独立 · 收起即归档',
         'state.attaching': '正在附着主对话…',
         'state.failed': '附着失败：{message}',
         'state.ended': '侧边对话已结束（已归档并断开）',
@@ -81,7 +84,7 @@ window.__ModuleLoader__.load({
         'guide.title': 'Side chat',
         'guide.description': 'Attached to the main conversation; ask without interrupting it',
         'childTitle.prefix': 'Side chat',
-        'note.shared': 'Attached to main · both sides independent',
+        'note.shared': 'Attached to main · independent · archived when closed',
         'state.attaching': 'Attaching to the main conversation…',
         'state.failed': 'Attach failed: {message}',
         'state.ended': 'Side chat ended (archived and detached)',
@@ -139,6 +142,33 @@ window.__ModuleLoader__.load({
     function messageOf(error) {
       if (error && typeof error.message === 'string' && error.message !== '') return error.message;
       return String(error);
+    }
+
+    /** 等一会儿（认领重试用）。 */
+    function delay(ms) {
+      return new Promise(function (resolve) {
+        later(resolve, ms);
+      });
+    }
+
+    /** 释放一条引用，失败也不吵。 */
+    function releaseQuietly(ref) {
+      if (!ref) return;
+      try {
+        ref.release();
+      } catch (_released) {
+        /* 已经释放过 */
+      }
+    }
+
+    /** 读一条引用的会话快照（引用失效时返回 undefined）。 */
+    function snapshotOf(ref) {
+      try {
+        const session = ref && ref.binding ? ref.binding.session : undefined;
+        return session ? session.getSnapshot() : undefined;
+      } catch (_stale) {
+        return undefined;
+      }
     }
 
     /** setTimeout 包一层：没这个全局也能跑（冒烟测试里就是这么喂的）。 */
@@ -291,6 +321,17 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** 把归档过的侧边会话放回来（归档态的 agent 会被 `agent/pre-step` 直接拒绝，不能跑）。 */
+      async function restore(childId) {
+        const workspace = ctx.get('uiWorkspace') || ctx.get('workspaces');
+        if (!workspace || typeof workspace.unarchiveSession !== 'function') return;
+        try {
+          await workspace.unarchiveSession(childId);
+        } catch (_unsupported) {
+          /* 本来就没归档，或者版本不支持：认领会告诉我们真的行不行 */
+        }
+      }
+
       function childTitle(parentId) {
         const listing = ctx.sessions.list && ctx.sessions.list.getSnapshot ? ctx.sessions.list.getSnapshot() : undefined;
         const row = listing && listing.byId ? listing.byId[parentId] : undefined;
@@ -299,50 +340,78 @@ window.__ModuleLoader__.load({
         return truncate(parentTitle === '' ? head : head + ' · ' + parentTitle, TITLE_MAX);
       }
 
-      /** 认领一个已存在的子会话：`ready` 落定且不是错误态才算数。 */
-      async function retain(childId) {
-        let ref;
-        try {
-          ref = ctx.sessions.retain({ sessionId: childId }, { source: 'gateway' });
-        } catch (_unknown) {
-          return undefined;
-        }
-        const outcome = await settleWithin(ref.ready, READY_TIMEOUT_MS);
-        if (outcome !== 'ok' && outcome !== 'timeout') {
-          try {
-            ref.release();
-          } catch (_released) {
-            /* ignore */
-          }
-          return undefined;
-        }
-        if (outcome === 'ok') {
-          const snapshot = ref.binding && ref.binding.session ? ref.binding.session.getSnapshot() : undefined;
-          if (snapshot && (snapshot.openState === 'error' || snapshot.removed === true)) {
+      /**
+       * 认领一个子会话。
+       *
+       * 为什么要重试（2026-11-03 实测踩出来的坑）：`ctx.sessions.fork` 只把子会话写进
+       * **列表摘要**（`recordMutation({kind:'placeholder'})`），而 `retain` → `materializeScope`
+       * → `manager.get(id)` 需要客户端已经**物化**出那个 Session 对象 —— 物化跟着
+       * `session/added` 那条控制流走，比 fork 的 RPC 返回晚一点。于是「fork 完立刻 retain」
+       * 会抛 `sessions.retain: unknown session …`，表现就是面板上「附着失败」，
+       * 而 Host 那边**子会话已经建好了**（每次都留一条空会话在侧边栏 —— 使用者看到的就是这个）。
+       *
+       * 所以：认领允许失败，用「一次 refresh + 若干次退避重试」把它等出来，并把最后一次
+       * 真实原因带回去给界面看，而不是吞成一句「fork」。
+       */
+      async function claim(childId) {
+        let reason = 'unknown';
+        let failure;
+        for (let attempt = 0; attempt < CLAIM_ATTEMPTS; attempt += 1) {
+          if (attempt > 0) await delay(CLAIM_RETRY_MS);
+          if (attempt === 0 && typeof ctx.sessions.refresh === 'function') {
             try {
-              ref.release();
-            } catch (_released) {
-              /* ignore */
+              await ctx.sessions.refresh();
+            } catch (_refreshFailed) {
+              /* 拉不到就靠重试 */
             }
-            return undefined;
           }
+          let ref;
+          try {
+            ref = ctx.sessions.retain({ sessionId: childId }, { source: 'gateway' });
+          } catch (error) {
+            reason = 'retain';
+            failure = error;
+            continue;
+          }
+          const outcome = await settleWithin(ref.ready, READY_TIMEOUT_MS);
+          if (outcome !== 'ok' && outcome !== 'timeout') {
+            releaseQuietly(ref);
+            reason = 'open';
+            failure = outcome;
+            continue;
+          }
+          if (outcome === 'ok') {
+            const snapshot = snapshotOf(ref);
+            if (snapshot && (snapshot.openState === 'error' || snapshot.removed === true)) {
+              releaseQuietly(ref);
+              reason = 'state';
+              failure = new Error('openState=' + String(snapshot.openState));
+              continue;
+            }
+          }
+          return { ok: true, ref: ref };
         }
-        return ref;
+        return { ok: false, reason: reason, error: failure };
       }
 
       /** fork 一个继承主对话上下文的新会话，改个能认出来的名字，然后认领它。 */
       async function fork(parentId) {
         const childId = await ctx.sessions.fork({ sessionId: parentId });
         writeChild(parentId, childId);
-        const ref = await retain(childId);
-        if (!ref) throw new Error(t('state.failed', { message: 'fork' }));
+        const claimed = await claim(childId);
+        if (!claimed.ok) {
+          // 认领不成就别把它留在侧边栏里当垃圾：忘掉记录 + 归档。
+          clearChild(parentId);
+          archive(childId);
+          throw new Error(claimed.reason + ': ' + messageOf(claimed.error));
+        }
         try {
-          const renamed = ref.binding.session.rename(childTitle(parentId));
+          const renamed = claimed.ref.binding.session.rename(childTitle(parentId));
           if (renamed && typeof renamed.catch === 'function') renamed.catch(function () {});
         } catch (_renameFailed) {
           /* 名字只是给人看的 */
         }
-        return { parentId: parentId, childId: childId, ref: ref, phase: 'ready' };
+        return { parentId: parentId, childId: childId, ref: claimed.ref, phase: 'ready' };
       }
 
       function peek(parentId) {
@@ -365,13 +434,15 @@ window.__ModuleLoader__.load({
         const task = (async function () {
           const remembered = readChild(parentId);
           if (remembered) {
-            const ref = await retain(remembered);
-            if (ref) {
-              const entry = { parentId: parentId, childId: remembered, ref: ref, phase: 'ready' };
+            await restore(remembered);
+            const claimed = await claim(remembered);
+            if (claimed.ok) {
+              const entry = { parentId: parentId, childId: remembered, ref: claimed.ref, phase: 'ready' };
               entries.set(parentId, entry);
               return entry;
             }
             clearChild(parentId);
+            archive(remembered);
           }
           const entry = await fork(parentId);
           entries.set(parentId, entry);
@@ -407,13 +478,35 @@ window.__ModuleLoader__.load({
         archive(oldChild);
       }
 
+      /**
+       * 侧边面板不再显示时的「临时」处理：释放引用 + 归档，于是左侧边栏里那条也没了
+       * （归档会话在默认视图里不出现）。正在跑的轮次不动 —— 归档会让 `agent/pre-step`
+       * 拒绝下一步，把回答切断。
+       */
+      async function suspend(parentId) {
+        const entry = entries.get(parentId);
+        if (!entry || entry.phase !== 'ready' || !entry.ref) return;
+        const snapshot = snapshotOf(entry.ref);
+        if (snapshot && snapshot.running === true) return;
+        const childId = entry.childId;
+        drop(entry);
+        archive(childId);
+      }
+
       function dispose() {
         for (const entry of Array.from(entries.values())) drop(entry);
         entries.clear();
         inflight.clear();
       }
 
-      return { peek: peek, ensure: ensure, reattach: reattach, end: end, dispose: dispose };
+      return {
+        peek: peek,
+        ensure: ensure,
+        reattach: reattach,
+        end: end,
+        suspend: suspend,
+        dispose: dispose
+      };
     }
     // #endregion
 
@@ -628,6 +721,17 @@ window.__ModuleLoader__.load({
           };
         },
         [attachments, parentId, revision, ended]
+      );
+
+      /** 面板不再显示时把侧边会话「收起来」：释放引用 + 归档（侧边栏那条也一起消失）。 */
+      React.useEffect(
+        function () {
+          if (!attachments) return undefined;
+          return function () {
+            attachments.suspend(parentId);
+          };
+        },
+        [attachments, parentId]
       );
 
       /** 所有动作共用的「忙时忽略、错就写在脸上」外壳。 */

@@ -50,10 +50,28 @@ DSH Web UI 的客户端插件。**会话 header 里多一枚「侧边对话」�
 
 ## 顶部那条
 
-- `⟡ 附着主对话 · 双向独立` —— 一句说明，没有别的装饰。
+- `⟡ 附着主对话 · 双向独立 · 收起即归档` —— 一句说明，没有别的装饰。
 - **重新附着**：主对话又推进了很多时，按最新进展重建侧边对话。旧的侧边会话会被归档
   （`archiveSession`，可逆），新的从当前主对话重新 fork。
 - **结束**：归档当前侧边会话并断开，tab 里显示「已结束 / 重新开始」。主对话一概不动。
+
+## 关于“不要新建对话”（2026-11-03 实测结论）
+
+这一条**做不到纯字面**，原因是平台约束，不是没接好线：
+
+- 左侧边栏 `sessionVisible()` 只对 `origin === 'subagent'` 的会话直接返回 false（另一个入口是
+  归档过滤器）。
+- 但 subagent-origin 会话**客户端不能 prompt**：`validateAddress` 与 prompt 路径都会报
+  `session/agent-busy: subagent Sessions require their durable parent address`，必须走
+  subagent delivery —— 那是「Agent 起一个任务」，不是自由对话。
+- 归档能隐藏，可归档会话的 `agent/pre-step` 会被直接 reject，答不了话。
+
+于是：**任何客户端创建的会话（fork / create）都必然在侧边栏出现一行。** 现在取的是能做到的折中：
+
+- **面板不显示时就归档**：tab 关掉、或切走到别的会话（正文卸载）→ `suspend()` 释放引用 + `archiveSession`，
+  侧栏那条同步消失；localStorage 里的附着记录保留，下次打开先 `unarchiveSession` 再认领，接着聊。
+- 用着的时候那一行在（标题 `侧边对话 · <主对话标题>`）。
+- 失败/重建留下的旧侧边会话会被归档，不会堆在侧栏里。
 
 ## 边界
 
@@ -80,11 +98,13 @@ DSH Web UI 的客户端插件。**会话 header 里多一枚「侧边对话」�
 
 ## 验收
 
-- 零依赖冒烟测试（94 项，不需要宿主/浏览器）：
+- 零依赖冒烟测试（107 项，不需要宿主/浏览器）：
   `node plugins/side-chat/test/client-smoke.cjs`
   —— 断言注册面（tab 类型 / 三个座位 / 语言包）、文案 key 一致、CSS 只用主题变量、
-  附着关系（fork / 复用 / 失效重 fork / 并发去重 / 重新附着 / 结束 / 卸载）、
-  组件三态与回调、`resolvePhase` 判据。
+  附着关系（fork / 复用 / **瞬时未物化后重试接住** / 失效重 fork / 并发去重 / 重新附着 / 结束 /
+  收起归档 / 卸载）、组件三态与回调、`resolvePhase` 判据。
+  其中 `flaky: {'side-1': 2}` 那一条是「附着失败」的回归测试：让前两次 `retain` 抛
+  `sessions.retain: unknown session`，断言第三次接住、只 fork 一次、不把自己刚建的会话归档掉。
 - 活体：`cordis_inspect_query` Client `Slots.listSubTree`
   root=`conversation.session.header.utilities` → occupants 里应有
   `{"id":"side-chat-trigger","order":-20,"active":true}`；
