@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none" role="img" aria-label="Side Chat">
+  <rect width="64" height="64" rx="14" fill="#1F2430"/>
+  <path d="M14 20.5A5.5 5.5 0 0 1 19.5 15h25a5.5 5.5 0 0 1 5.5 5.5v13A5.5 5.5 0 0 1 44.5 39H30.8l-8.2 6.3a1.2 1.2 0 0 1-1.9-.95V39h-1.2A5.5 5.5 0 0 1 14 33.5v-13Z" fill="#8FA6C9"/>
+  <path d="M24 30.5A4.5 4.5 0 0 1 28.5 26h20A4.5 4.5 0 0 1 53 30.5v11A4.5 4.5 0 0 1 48.5 46H40l-6.6 5.1a1 1 0 0 1-1.6-.8V46h-3.3A4.5 4.5 0 0 1 24 41.5v-11Z" fill="#4C7DF0"/>
+  <circle cx="33.5" cy="36" r="1.9" fill="#F4F7FC"/>
+  <circle cx="39.5" cy="36" r="1.9" fill="#F4F7FC"/>
+  <circle cx="45.5" cy="36" r="1.9" fill="#F4F7FC"/>
+</svg>

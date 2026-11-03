@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Side Chat",
+    "description": "Open a temporary side conversation in the right sidebar that is attached to the current conversation: it sees the main context, while your side questions stay on the side and never touch the main log."
+  }
+}
