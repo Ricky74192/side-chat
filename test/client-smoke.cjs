@@ -584,6 +584,16 @@ async function main() {
   eq('未附着时是 attaching 态', attaching.props['data-side-chat'], 'attaching');
   ok('attaching 态写着「正在附着」', texts(attaching).join(' ').indexOf('正在附着') >= 0, texts(attaching).join(' '));
 
+  // 5.3b 插件已卸载（没有 runtime）时给「不可用」，而不是永远转圈
+  const L = boot({}, false);
+  const noRuntime = L.I.SideChatTab({
+    t: L.t,
+    sessionId: 'p9',
+    SessionProvider: function () {},
+    renderSlot: function () {}
+  });
+  eq('没有 runtime 时降级', noRuntime.props['data-side-chat'], 'unavailable');
+
   // 5.4 侧边 tab：ready 态
   const runtimeK = K.I.runtimeOf();
   ok('runtime 里有 apply 建的附着关系', typeof runtimeK.attachments.ensure === 'function');

@@ -586,7 +586,12 @@ window.__ModuleLoader__.load({
      * 组件不持有任何「每个会话一份」的写状态，全部来自 `attachments` 缓存。
      */
     function SideChatTab(props) {
-      const t = props.t;
+      const t =
+        typeof props.t === 'function'
+          ? props.t
+          : function (key) {
+              return key;
+            };
       const parentId = props.parentSessionId || props.sessionId;
       const attachments = runtime ? runtime.attachments : undefined;
 
@@ -679,6 +684,15 @@ window.__ModuleLoader__.load({
       }
 
       const style = h('style', null, CSS);
+
+      if (!attachments) {
+        return h(
+          'div',
+          { className: 'sdc-root', 'data-side-chat': 'unavailable' },
+          style,
+          h(StateBlock, { text: t('state.unavailable') })
+        );
+      }
 
       if (failure) {
         return h(
